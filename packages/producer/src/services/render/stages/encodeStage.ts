@@ -53,8 +53,13 @@ export interface EncodeStageInput {
   needsAlpha: boolean;
   /** True iff the composition has audio. Drives the sidecar copy. */
   hasAudio: boolean;
-  /** Path to the mixed audio (only read when `hasAudio` is true). */
-  audioOutputPath: string;
+  /**
+   * Path to the mixed audio. Required when `hasAudio` is `true` (the
+   * png-sequence sidecar copy reads it); ignored when `hasAudio` is
+   * `false`. Distributed chunk workers mux audio once at assemble time
+   * and pass `hasAudio: false` here, so the field is left optional.
+   */
+  audioOutputPath?: string;
   /** Mp4 vs png-sequence vs … gates the entire stage branch. */
   isPngSequence: boolean;
   /** Encoder preset (codec, preset, pixelFormat, hdr). Only used on the non-png path. */
@@ -67,6 +72,16 @@ export interface EncodeStageInput {
   abortSignal: AbortSignal | undefined;
   assertNotAborted: () => void;
   onProgress?: ProgressCallback;
+  /**
+   * Pass-through of `EncoderOptions.lockGopForChunkConcat`. When `true`,
+   * the encode emits closed-GOP keyframes at every `gopSize` boundary so
+   * downstream `ffmpeg -f concat -c copy` round-trips losslessly. Only the
+   * distributed chunk worker (`renderChunk`) sets this — the in-process
+   * renderer's call site omits it, preserving the existing open-GOP output.
+   */
+  lockGopForChunkConcat?: boolean;
+  /** Required when `lockGopForChunkConcat === true`. Number of frames per GOP — set to the chunk's frame count by `renderChunk`. */
+  gopSize?: number;
 }
 
 export interface EncodeStageResult {
@@ -119,7 +134,7 @@ export async function runEncodeStage(input: EncodeStageInput): Promise<EncodeSta
       const dst = join(outputPath, `frame_${String(i + 1).padStart(6, "0")}.png`);
       copyFileSync(join(framesDir, name), dst);
     });
-    if (hasAudio && existsSync(audioOutputPath)) {
+    if (hasAudio && audioOutputPath && existsSync(audioOutputPath)) {
       // Sidecar audio for callers that need to re-mux later. png-sequence
       // has no container of its own, so this is the only place audio
       // can land alongside the frames.
@@ -145,6 +160,11 @@ export async function runEncodeStage(input: EncodeStageInput): Promise<EncodeSta
     pixelFormat: preset.pixelFormat,
     useGpu: job.config.useGpu,
     hdr: preset.hdr,
+    // Distributed chunk renders pass these so the encoder writes closed-GOP
+    // keyframes that survive `-f concat -c copy` at assemble time. In-process
+    // renders leave both undefined → preserves the existing open-GOP output.
+    lockGopForChunkConcat: input.lockGopForChunkConcat === true,
+    gopSize: input.gopSize,
   };
   const encodeResult = enableChunkedEncode
     ? await encodeFramesChunkedConcat(

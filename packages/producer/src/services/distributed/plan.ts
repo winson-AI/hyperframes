@@ -24,15 +24,11 @@
  * never have to handle them.
  */
 
-import { execFile as execFileCallback } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import { type CanvasResolution, type Fps } from "@hyperframes/core";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { type CanvasResolution } from "@hyperframes/core";
 import { type EngineConfig, resolveConfig } from "@hyperframes/engine";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
-import { type RenderConfig, type RenderJob, createRenderJob } from "../renderOrchestrator.js";
 import { runAudioStage } from "../render/stages/audioStage.js";
 import { runCompileStage } from "../render/stages/compileStage.js";
 import { runExtractVideosStage } from "../render/stages/extractVideosStage.js";
@@ -50,8 +46,7 @@ import {
 } from "../render/stages/planHash.js";
 import { validateNoGpuEncode, validateNoSystemFonts } from "../render/planValidation.js";
 import { snapshotRuntimeEnv } from "../render/runtimeEnvSnapshot.js";
-
-const execFile = promisify(execFileCallback);
+import { buildSyntheticRenderJob, readFfmpegVersion, readProducerVersion } from "./shared.js";
 
 /**
  * Caller-supplied configuration for a distributed render. `fps`, `width`,
@@ -190,81 +185,6 @@ export function buildChunkSlices(
 }
 
 /**
- * Map a `DistributedRenderConfig` onto the in-process `RenderConfig` shape
- * the stage functions consume. Distributed plan() is the first caller of
- * the staged renderer that operates without a full RenderJob — we synthesize
- * one from the distributed config so the existing stage interfaces don't
- * need a parallel "distributed mode" overload.
- */
-function buildSyntheticRenderJob(config: DistributedRenderConfig): RenderJob {
-  const renderConfig: RenderConfig = {
-    fps: { num: config.fps, den: 1 } satisfies Fps,
-    quality: config.quality ?? "standard",
-    format: config.format,
-    crf: config.crf,
-    videoBitrate: config.bitrate,
-    outputResolution: config.outputResolution,
-    // Distributed mode hard-pins to software GPU. The plan-time validator
-    // (see validateNoGpuEncode) refuses to fan out otherwise.
-    useGpu: false,
-    debug: false,
-    entryFile: config.entryFile ?? "index.html",
-    logger: config.logger ?? defaultLogger,
-    // HDR is banned in distributed mode. force-sdr keeps the
-    // extract / encoder paths off the HDR branches entirely.
-    hdrMode: config.hdrMode ?? "force-sdr",
-    producerConfig: config.producerConfig,
-  };
-  return createRenderJob(renderConfig);
-}
-
-/**
- * Resolve the producer package version by walking up from the calling module
- * until a `package.json` whose `name === "@hyperframes/producer"` is found.
- * Works for both the bundled `dist/index.js` (1 level up) and the unbundled
- * source tree (`src/services/distributed/plan.ts` → 4 levels up).
- */
-function readProducerVersion(): string {
-  const startDir = dirname(fileURLToPath(import.meta.url));
-  let current = startDir;
-  for (let i = 0; i < 10; i++) {
-    const candidate = join(current, "package.json");
-    if (existsSync(candidate)) {
-      try {
-        const pkg = JSON.parse(readFileSync(candidate, "utf-8")) as {
-          name?: string;
-          version?: string;
-        };
-        if (pkg.name === "@hyperframes/producer" && typeof pkg.version === "string") {
-          return pkg.version;
-        }
-      } catch {
-        // Fall through to the next ancestor.
-      }
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  return "0.0.0-unknown";
-}
-
-/**
- * Spawn `ffmpeg -version` and return the first line (e.g. `"ffmpeg version 6.1.1"`).
- * The string is opaque — `planHash` mixes it in verbatim, so any drift across
- * worker hosts trips a `FFMPEG_VERSION_MISMATCH` rather than producing pixels
- * that subtly disagree with the plan's baked-in encoder args.
- */
-async function readFfmpegVersion(): Promise<string> {
-  const { stdout } = await execFile("ffmpeg", ["-version"], { maxBuffer: 1024 * 1024 });
-  const firstLine = stdout.split(/\r?\n/)[0]?.trim() ?? "";
-  if (!firstLine) {
-    throw new Error("[plan] ffmpeg -version returned empty output");
-  }
-  return firstLine;
-}
-
-/**
  * Hash the deterministic-font bundle that ships inside `@hyperframes/producer`.
  * The compiled HTML already inlines per-family `@font-face` data URIs, so the
  * snapshot SHA exists primarily to detect cross-version font-bundle drift on
@@ -391,7 +311,20 @@ export async function plan(
     forceScreenshot: false,
   };
 
-  const job = buildSyntheticRenderJob(config);
+  const job = buildSyntheticRenderJob({
+    fps: { num: config.fps, den: 1 },
+    quality: config.quality ?? "standard",
+    format: config.format,
+    crf: config.crf,
+    bitrate: config.bitrate,
+    outputResolution: config.outputResolution,
+    // HDR is banned in distributed mode. force-sdr keeps the
+    // extract / encoder paths off the HDR branches entirely.
+    hdrMode: config.hdrMode ?? "force-sdr",
+    entryFile: config.entryFile ?? "index.html",
+    logger: config.logger,
+    producerConfig: config.producerConfig,
+  });
   const entryFile = config.entryFile ?? "index.html";
   const htmlPath = join(projectDir, entryFile);
   if (!existsSync(htmlPath)) {

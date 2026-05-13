@@ -4,7 +4,11 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { RUNTIME_ENV_PREFIXES, snapshotRuntimeEnv } from "./runtimeEnvSnapshot.js";
+import {
+  applyRuntimeEnvSnapshot,
+  RUNTIME_ENV_PREFIXES,
+  snapshotRuntimeEnv,
+} from "./runtimeEnvSnapshot.js";
 
 describe("snapshotRuntimeEnv", () => {
   it("captures PRODUCER_RUNTIME_* keys", () => {
@@ -97,5 +101,59 @@ describe("snapshotRuntimeEnv", () => {
     // snapshot back; asymmetric handling would let stale controller env
     // leak into chunk-worker behavior.
     expect(RUNTIME_ENV_PREFIXES).toEqual(["PRODUCER_RUNTIME_", "PRODUCER_RENDER_"]);
+  });
+});
+
+describe("applyRuntimeEnvSnapshot", () => {
+  it("filters by RUNTIME_ENV_PREFIXES — refuses arbitrary keys", () => {
+    const env: Record<string, string | undefined> = {};
+    applyRuntimeEnvSnapshot(
+      {
+        PRODUCER_RUNTIME_OK: "ok",
+        // A poisoned planDir could include `PATH` or `LD_PRELOAD`;
+        // the apply-side filter must drop them.
+        PATH: "/evil/bin",
+        ARBITRARY_KEY: "x",
+      },
+      env,
+    );
+    expect(env.PRODUCER_RUNTIME_OK).toBe("ok");
+    expect(env.PATH).toBeUndefined();
+    expect(env.ARBITRARY_KEY).toBeUndefined();
+  });
+
+  it("restore() reverts touched keys and only those keys", () => {
+    const env: Record<string, string | undefined> = {
+      PRODUCER_RUNTIME_PREEXISTING: "host-value",
+      PRODUCER_RENDER_NEW: undefined,
+      HOST_UNRELATED: "stays",
+    };
+    const { restore } = applyRuntimeEnvSnapshot(
+      {
+        PRODUCER_RUNTIME_PREEXISTING: "snapshot-value",
+        PRODUCER_RENDER_NEW: "snapshot-new",
+      },
+      env,
+    );
+    expect(env.PRODUCER_RUNTIME_PREEXISTING).toBe("snapshot-value");
+    expect(env.PRODUCER_RENDER_NEW).toBe("snapshot-new");
+
+    restore();
+    // Pre-existing key returns to its host value; previously-undefined
+    // key is deleted (not left as the snapshot value).
+    expect(env.PRODUCER_RUNTIME_PREEXISTING).toBe("host-value");
+    expect(env.PRODUCER_RENDER_NEW).toBeUndefined();
+    // Unrelated keys are untouched at apply time AND at restore time.
+    expect(env.HOST_UNRELATED).toBe("stays");
+  });
+
+  it("restore() is safe to call multiple times", () => {
+    const env: Record<string, string | undefined> = {};
+    const { restore } = applyRuntimeEnvSnapshot({ PRODUCER_RUNTIME_X: "y" }, env);
+    restore();
+    expect(env.PRODUCER_RUNTIME_X).toBeUndefined();
+    // Second restore is a no-op (no entries to revert).
+    expect(() => restore()).not.toThrow();
+    expect(env.PRODUCER_RUNTIME_X).toBeUndefined();
   });
 });

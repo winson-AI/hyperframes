@@ -213,6 +213,58 @@ function collectPlanAssetShas(planDir: string): {
 }
 
 /**
+ * Read a frozen plan directory back from disk and recompute its
+ * content-addressed `planHash` over the actual on-disk bytes — including
+ * the canonical encoder JSON, which is written via
+ * {@link canonicalJsonStringify} so reading the file gives us the exact
+ * string that fed the controller's hash.
+ *
+ * Distributed chunk workers call this at boot to verify their planDir is
+ * the same one the controller wrote: any mismatch (corrupted artifact,
+ * partial S3 download, manual tampering) trips a non-retryable
+ * `PLAN_HASH_MISMATCH` before the chunk renders.
+ *
+ * Throws if `plan.json` or `meta/encoder.json` are missing/malformed —
+ * callers should catch those as `MISSING_PLAN_ARTIFACT` rather than
+ * lumping them with hash drift.
+ */
+export function recomputePlanHashFromPlanDir(planDir: string): string {
+  const planJsonPath = join(planDir, "plan.json");
+  const encoderJsonPath = join(planDir, "meta", "encoder.json");
+  if (!existsSync(planJsonPath)) {
+    throw new Error(`[freezePlan] plan.json missing: ${planJsonPath}`);
+  }
+  if (!existsSync(encoderJsonPath)) {
+    throw new Error(`[freezePlan] meta/encoder.json missing: ${encoderJsonPath}`);
+  }
+
+  const planJson = JSON.parse(readFileSync(planJsonPath, "utf-8")) as {
+    producerVersion: string;
+    ffmpegVersion: string;
+    fontSnapshotSha: string;
+    dimensions: PlanDimensions;
+  };
+
+  // Encoder JSON is consumed as raw bytes so the hashing input matches
+  // the on-disk file byte-for-byte. Re-parsing + re-canonicalizing would
+  // be susceptible to floating-point round-trip drift, JSON whitespace
+  // normalization differences, and Node version skew on number printing.
+  const encoderConfigCanonicalJson = readFileSync(encoderJsonPath, "utf-8");
+
+  const { compositionHtml, assets } = collectPlanAssetShas(planDir);
+
+  return computePlanHash({
+    compositionHtml,
+    assets,
+    fontSnapshotSha: planJson.fontSnapshotSha,
+    encoderConfigCanonicalJson,
+    producerVersion: planJson.producerVersion,
+    ffmpegVersion: planJson.ffmpegVersion,
+    dimensions: planJson.dimensions,
+  });
+}
+
+/**
  * Freeze a plan directory: write `meta/*.json` + top-level `plan.json`, then
  * compute `planHash` over the canonicalized contents.
  *

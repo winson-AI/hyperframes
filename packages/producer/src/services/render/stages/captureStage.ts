@@ -94,6 +94,27 @@ export interface CaptureStageInput {
   abortSignal: AbortSignal | undefined;
   assertNotAborted: () => void;
   onProgress?: ProgressCallback;
+  /**
+   * Capture a sub-range `[startFrame, endFrame)` of the composition's
+   * timeline. Used by distributed `renderChunk` workers to render only
+   * their assigned chunk. Captured frames are written with file names
+   * normalized to start at zero (`frame_000000.{ext}`) so the encoder
+   * doesn't need an `-start_number` override; per-frame TIMES still
+   * reflect the absolute frame index via `(absIdx * fps.den) / fps.num`,
+   * keeping the page's virtual clock identical to what an in-process
+   * render at that frame would see.
+   *
+   * Only honored on the sequential capture branch (workerCount === 1).
+   * The parallel branch in this stage targets in-process renders where
+   * adaptive retry across the whole timeline is the contract, and chunk
+   * workers fan out at the activity layer instead. Passing `frameRange`
+   * with `workerCount > 1` throws — the caller should reduce
+   * `workerCount` to 1.
+   *
+   * Default `undefined`: the stage captures `[0, totalFrames)` (the
+   * in-process contract).
+   */
+  frameRange?: { startFrame: number; endFrame: number };
 }
 
 export interface CaptureStageResult {
@@ -122,6 +143,7 @@ export async function runCaptureStage(input: CaptureStageInput): Promise<Capture
     assertNotAborted,
     onProgress,
     needsAlpha,
+    frameRange,
   } = input;
   let { workerCount, probeSession } = input;
   let lastBrowserConsole: string[] = [];
@@ -132,6 +154,26 @@ export async function runCaptureStage(input: CaptureStageInput): Promise<Capture
   // pass-through.
   const captureCfg: EngineConfig =
     cfg.forceScreenshot === forceScreenshot ? cfg : { ...cfg, forceScreenshot };
+
+  if (frameRange !== undefined && workerCount > 1) {
+    throw new Error(
+      `[captureStage] frameRange capture requires workerCount === 1 (received workerCount=${workerCount}). ` +
+        `Distributed chunk workers fan out at the activity layer; reduce workerCount to 1 when passing frameRange.`,
+    );
+  }
+  if (frameRange !== undefined) {
+    if (
+      !Number.isFinite(frameRange.startFrame) ||
+      !Number.isFinite(frameRange.endFrame) ||
+      frameRange.startFrame < 0 ||
+      frameRange.endFrame <= frameRange.startFrame
+    ) {
+      throw new Error(
+        `[captureStage] invalid frameRange: ${JSON.stringify(frameRange)}. ` +
+          `Expected non-negative startFrame strictly less than endFrame.`,
+      );
+    }
+  }
 
   if (workerCount > 1) {
     // Parallel capture
@@ -202,19 +244,29 @@ export async function runCaptureStage(input: CaptureStageInput): Promise<Capture
       assertNotAborted();
       lastBrowserConsole = session.browserConsoleBuffer;
 
-      for (let i = 0; i < totalFrames; i++) {
+      // `frameRange` captures only a sub-range of the timeline. Per-frame
+      // TIMES still use the absolute composition frame index so the page's
+      // virtual clock matches an in-process render at the same frame;
+      // file NAMES are normalized to 0 (via the relative loop index `i`)
+      // so the encoder can read frames without an `-start_number` override.
+      const rangeStart = frameRange?.startFrame ?? 0;
+      const rangeEnd = frameRange?.endFrame ?? totalFrames;
+      const rangeFrames = rangeEnd - rangeStart;
+
+      for (let i = 0; i < rangeFrames; i++) {
         assertNotAborted();
-        const time = (i * job.config.fps.den) / job.config.fps.num;
+        const absoluteIdx = rangeStart + i;
+        const time = (absoluteIdx * job.config.fps.den) / job.config.fps.num;
         await captureFrame(session, i, time);
         job.framesRendered = i + 1;
 
-        const frameProgress = (i + 1) / totalFrames;
+        const frameProgress = (i + 1) / rangeFrames;
         const progress = 25 + frameProgress * 45;
 
         updateJobStatus(
           job,
           "rendering",
-          `Capturing frame ${i + 1}/${totalFrames}`,
+          `Capturing frame ${i + 1}/${rangeFrames}`,
           Math.round(progress),
           onProgress,
         );
