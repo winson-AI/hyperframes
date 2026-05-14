@@ -148,6 +148,30 @@ exercises one of:
 See `DISTRIBUTED-RENDERING-PLAN.md` §10.2 for the equivalence axes each
 distributed fixture covers.
 
+### Fixture pattern (4.2 onward)
+
+Each `tests/distributed/<name>/` fixture has the same structure as a
+top-level fixture (`meta.json` + `src/index.html` + `output/output.mp4`).
+Differences worth knowing:
+
+- `renderConfig.chunkSize` is **required** — pick a value that yields
+  N≥2 chunks for your fixture's frame count (e.g. 60 frames at
+  `chunkSize: 15` produces N=4). Without this the fixture renders in a
+  single chunk and never exercises the seam.
+- The fixture's ID on the CLI is just `<name>` (no `distributed/`
+  prefix). `bun run --cwd packages/producer docker:test mp4-h264-sdr`
+  works the same as for a top-level fixture.
+- The `distributed` tag is informational — it doesn't gate any tag-based
+  filter today. Add it so the fixture is easy to find by tag.
+- The composition should stress *state continuity* across the chunk
+  seams: an animation crossing a seam, a counter, a rotation. A
+  fully-static composition would pass even if chunk-boundary state was
+  broken.
+- Baselines must be generated inside Docker — see the section above.
+  The baseline is rendered by the in-process renderer (the source of
+  truth for golden output); `--mode=distributed-simulated` is validated
+  against the same baseline.
+
 ## Tags
 
 Common `tags` values control which fixtures the default `bun test`

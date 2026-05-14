@@ -274,63 +274,74 @@ function discoverTestSuites(
     throw new Error(`Tests directory not found: ${testsDir}`);
   }
 
-  const entries = readdirSync(testsDir);
   const suites: TestSuite[] = [];
 
-  for (const entry of entries) {
-    const dir = join(testsDir, entry);
-    if (!statSync(dir).isDirectory()) continue;
-    if (entry === "node_modules" || entry.startsWith(".")) continue;
-
-    // If filter is specified, skip non-matching tests
-    if (filterNames.length > 0 && !filterNames.includes(entry)) {
-      continue;
-    }
+  // Validate + push a single candidate fixture directory. Logs the reason
+  // and returns silently if the directory doesn't look like a fixture, so
+  // callers can blindly hand over every candidate.
+  const tryAddSuite = (id: string, dir: string): void => {
+    if (filterNames.length > 0 && !filterNames.includes(id)) return;
 
     const srcDir = join(dir, "src");
     const metaPath = join(dir, "meta.json");
 
-    // Validate structure
     if (!existsSync(srcDir) || !statSync(srcDir).isDirectory()) {
-      console.warn(`⚠️  Skipping ${entry}: missing src/ directory`);
-      continue;
+      console.warn(`⚠️  Skipping ${id}: missing src/ directory`);
+      return;
     }
     if (!existsSync(join(srcDir, "index.html"))) {
-      console.warn(`⚠️  Skipping ${entry}: missing src/index.html`);
-      continue;
+      console.warn(`⚠️  Skipping ${id}: missing src/index.html`);
+      return;
     }
     if (!existsSync(metaPath)) {
-      console.warn(`⚠️  Skipping ${entry}: missing meta.json`);
-      continue;
+      console.warn(`⚠️  Skipping ${id}: missing meta.json`);
+      return;
     }
 
-    // Parse and validate meta.json
     let meta: TestMetadata;
     try {
       const metaRaw = JSON.parse(readFileSync(metaPath, "utf-8"));
       meta = validateMetadata(metaRaw);
     } catch (error) {
       console.warn(
-        `⚠️  Skipping ${entry}: invalid meta.json - ${error instanceof Error ? error.message : String(error)}`,
+        `⚠️  Skipping ${id}: invalid meta.json - ${error instanceof Error ? error.message : String(error)}`,
       );
-      continue;
+      return;
     }
 
-    // Skip tests with excluded tags
     if (excludeTags.length > 0 && meta.tags.some((t) => excludeTags.includes(t))) {
       logPretty(
-        `Skipping ${entry}: excluded by tags [${meta.tags.filter((t) => excludeTags.includes(t)).join(", ")}]`,
+        `Skipping ${id}: excluded by tags [${meta.tags.filter((t) => excludeTags.includes(t)).join(", ")}]`,
         "⏭️",
       );
+      return;
+    }
+
+    suites.push({ id, dir, srcDir, meta });
+  };
+
+  for (const entry of readdirSync(testsDir)) {
+    const dir = join(testsDir, entry);
+    if (!statSync(dir).isDirectory()) continue;
+    if (entry === "node_modules" || entry.startsWith(".")) continue;
+
+    // `tests/distributed/<name>/` is the home for fixtures authored
+    // specifically for the distributed pipeline (see tests/README.md and
+    // DISTRIBUTED-RENDERING-PLAN.md §10.2). Recurse one level deeper so
+    // each `<name>` becomes a first-class fixture ID (`mp4-h264-sdr`,
+    // `mov-prores`, …) the user can target on the CLI without their
+    // namespace prefix.
+    if (entry === "distributed") {
+      for (const sub of readdirSync(dir)) {
+        const subDir = join(dir, sub);
+        if (!statSync(subDir).isDirectory()) continue;
+        if (sub === "node_modules" || sub.startsWith(".")) continue;
+        tryAddSuite(sub, subDir);
+      }
       continue;
     }
 
-    suites.push({
-      id: entry,
-      dir,
-      srcDir,
-      meta,
-    });
+    tryAddSuite(entry, dir);
   }
 
   return suites;
